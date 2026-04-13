@@ -1,6 +1,7 @@
 """Terminal dashboard rendering using rich."""
 
 import os
+import sys
 import time
 from datetime import datetime
 from decimal import Decimal
@@ -175,8 +176,8 @@ def build_dashboard(state: BotState, tracker: PnLTracker) -> str:
 
 def print_dashboard(state: BotState, tracker: PnLTracker) -> None:
     """Clear screen and print the dashboard."""
-    # Clear terminal
-    os.system("cls" if os.name == "nt" else "clear")
+    if sys.stdout.isatty():
+        os.system("cls" if os.name == "nt" else "clear")
     markup = build_dashboard(state, tracker)
     console.print(markup)
 
