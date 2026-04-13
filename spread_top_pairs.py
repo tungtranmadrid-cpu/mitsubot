@@ -18,7 +18,6 @@ import os
 import sys
 import time
 import threading
-from pathlib import Path
 
 if os.name == "nt":
     os.system("chcp 65001 > nul")
@@ -330,29 +329,14 @@ def print_table(data: list[dict], exchange: str, sort_by: str) -> None:
     print(f"  {CYAN}{'─' * 96}{RESET}\n")
 
 
-def update_env_pairs(pairs: list[str], env_path: str = ".env") -> None:
-    """Update the pairs= line in the .env file."""
-    env_file = Path(env_path)
-    if not env_file.exists():
-        logger.error(f".env file not found at {env_file.resolve()}")
-        return
+def update_env_pairs(pairs: list[str], env_path: str | None = None) -> None:
+    """Persist the pairs list to the JSON store (Railway-friendly).
 
-    content = env_file.read_text(encoding="utf-8")
-    new_pairs_line = f"PAIRS={','.join(pairs)}"
-
-    lines = content.splitlines()
-    updated = False
-    for i, line in enumerate(lines):
-        if line.strip().upper().startswith("PAIRS="):
-            lines[i] = new_pairs_line
-            updated = True
-            break
-
-    if not updated:
-        lines.append(new_pairs_line)
-
-    env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    logger.info(f"Updated .env pairs: {new_pairs_line}")
+    The legacy name is kept so existing callers keep working. `env_path` is
+    accepted but ignored — storage path is controlled by the PAIRS_FILE env var.
+    """
+    from pairs_store import save_pairs
+    save_pairs(pairs)
 
 
 class PairRefresher:

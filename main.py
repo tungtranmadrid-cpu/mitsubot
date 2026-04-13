@@ -18,13 +18,17 @@ from spread_top_pairs import PairRefresher
 
 # ── Logging setup ────────────────────────────────────────────────────
 
+import os as _os
+
+_log_handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+if _os.getenv("LOG_FILE", "").strip():
+    _log_handlers.append(logging.FileHandler(_os.environ["LOG_FILE"], encoding="utf-8"))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     datefmt="%H:%M:%S",
-    handlers=[
-        logging.FileHandler("bot.log", encoding="utf-8"),
-    ],
+    handlers=_log_handlers,
 )
 logger = logging.getLogger("main")
 

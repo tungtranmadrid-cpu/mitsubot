@@ -25,14 +25,14 @@ class Config:
 
 
 def load_config(env_path: str = ".env") -> Config:
-    """Load and validate configuration from .env file."""
-    env_file = Path(env_path)
-    if not env_file.exists():
-        print(f"[ERROR] .env file not found at: {env_file.resolve()}")
-        print("Copy .env.example to .env and fill in your API credentials.")
-        sys.exit(1)
+    """Load and validate configuration.
 
-    load_dotenv(env_file)
+    Loads `.env` if it exists (local dev). On Railway, env vars are injected
+    by the platform and the file is absent — that's fine.
+    """
+    env_file = Path(env_path)
+    if env_file.exists():
+        load_dotenv(env_file)
 
     required_vars = {
         "MEXC_API_KEY": "MEXC API Key",
@@ -49,16 +49,22 @@ def load_config(env_path: str = ".env") -> Config:
         print("\n".join(missing))
         sys.exit(1)
 
-    # Parse PAIRS list (comma-separated), fallback to DEFAULT_PAIR
+    # Pairs: persisted JSON store wins over env (auto-refresher writes to it).
+    from pairs_store import load_pairs as load_saved_pairs
+
     default_pair = os.getenv("DEFAULT_PAIR", "BTCUSDT").upper()
-    pairs_raw = os.getenv("PAIRS", "").strip()
-    if pairs_raw:
-        pairs = tuple(p.strip().upper() for p in pairs_raw.split(",") if p.strip())
+    saved = load_saved_pairs()
+    if saved:
+        pairs = tuple(saved)
     else:
-        pairs = (default_pair,)
+        pairs_raw = os.getenv("PAIRS", "").strip()
+        if pairs_raw:
+            pairs = tuple(p.strip().upper() for p in pairs_raw.split(",") if p.strip())
+        else:
+            pairs = (default_pair,)
 
     if not pairs:
-        print("[ERROR] No trading pairs configured. Set PAIRS or DEFAULT_PAIR in .env.")
+        print("[ERROR] No trading pairs configured. Set PAIRS or DEFAULT_PAIR.")
         sys.exit(1)
 
     try:
