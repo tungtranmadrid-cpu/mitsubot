@@ -22,6 +22,9 @@ class Config:
     buy_retry_timeout: int      # milliseconds
     sell_retry_timeout: int     # milliseconds
     min_spread_pct: Decimal
+    buy_max_price_drift_pct: Decimal   # stop retrying partial buy if price drifted more than this %
+    buy_max_retries: int               # max partial-fill retry iterations (hard safety cap)
+    spread_history_size: int           # rolling window for avg bid-ask spread per pair
 
 
 def load_config(env_path: str = ".env") -> Config:
@@ -79,6 +82,9 @@ def load_config(env_path: str = ".env") -> Config:
             buy_retry_timeout=int(os.getenv("BUY_RETRY_TIMEOUT", "5000")),
             sell_retry_timeout=int(os.getenv("SELL_RETRY_TIMEOUT", "5000")),
             min_spread_pct=Decimal(os.getenv("MIN_SPREAD_PCT", "0.01")),
+            buy_max_price_drift_pct=Decimal(os.getenv("BUY_MAX_PRICE_DRIFT_PCT", "0.3")),
+            buy_max_retries=int(os.getenv("BUY_MAX_RETRIES", "10")),
+            spread_history_size=int(os.getenv("SPREAD_HISTORY_SIZE", "30")),
         )
     except (ValueError, TypeError) as e:
         print(f"[ERROR] Invalid config value: {e}")

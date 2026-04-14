@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import random
 import time
+from collections import deque
 from decimal import Decimal
 
 from config import Config
@@ -37,6 +38,8 @@ class TradingEngine:
         self.state = state
         self.pair_info = pair_info
         self.pairs_info = pairs_info or {pair_info.symbol: pair_info}
+        # Rolling spread_pct history per pair (for above-market sell pricing).
+        self._spread_history: dict[str, deque] = {}
 
     def switch_pair(self, symbol: str) -> None:
         """Switch to a different trading pair before a new cycle."""
@@ -54,13 +57,29 @@ class TradingEngine:
         print_dashboard(self.state, self.tracker)
 
     def _update_prices(self, bid: Decimal, ask: Decimal) -> None:
-        """Update state with current bid/ask and spread."""
+        """Update state with current bid/ask and spread, and record spread history."""
         self.state.best_bid = bid
         self.state.best_ask = ask
         if bid > 0:
             self.state.spread_pct = ((ask - bid) / bid) * Decimal("100")
         else:
             self.state.spread_pct = Decimal("0")
+
+        if self.state.spread_pct > 0:
+            symbol = self.pair_info.symbol
+            hist = self._spread_history.get(symbol)
+            if hist is None:
+                hist = deque(maxlen=self.config.spread_history_size)
+                self._spread_history[symbol] = hist
+            hist.append(self.state.spread_pct)
+
+    def _avg_spread_pct(self) -> Decimal:
+        """Average of recorded spread_pct for the current pair. Falls back to min_spread_pct."""
+        hist = self._spread_history.get(self.pair_info.symbol)
+        if not hist:
+            return self.config.min_spread_pct
+        total = sum(hist, Decimal("0"))
+        return total / Decimal(len(hist))
 
     def _compute_vwap(self, short_window: int = 50) -> tuple[Decimal, Decimal]:
         """
@@ -228,13 +247,19 @@ class TradingEngine:
 
     def step_buy(self) -> dict:
         """
-        Place a limit buy at best bid.
+        Place limit buy orders until the full target quantity is filled.
+
+        Loops on partial fills: cancels the remainder, re-quotes at the latest
+        best-bid, and places a new buy for the unfilled portion. Stops early
+        if the new buy price drifts more than `buy_max_price_drift_pct` above
+        the initial reference price, or after `buy_max_retries` iterations.
+
         Returns dict with keys: success, filled_qty, avg_price, cost
-        or success=False to go back to scanning.
+        (avg_price is the weighted average across all fills).
         """
         self.state.status = BotStatus.BUYING
 
-        # Get USDT balance (1 call per cycle as per rate limit rules)
+        # One balance fetch per buy cycle (stays within rate limits).
         try:
             usdt_balance = self.api.get_balance(self.pair_info.quote_asset)
             self.state.usdt_balance = usdt_balance
@@ -243,113 +268,150 @@ class TradingEngine:
             time.sleep(2)
             return {"success": False}
 
-        # Compute improved buy price (bid + 1 tick if spread wide enough)
-        buy_price, _ = self._compute_improved_prices(self.state.best_bid, self.state.best_ask)
-
-        # Calculate quantity
-        qty = self.order_mgr.calculate_buy_quantity(usdt_balance, buy_price)
-        if qty is None:
+        # Initial target: size at current bid.
+        initial_buy_price, _ = self._compute_improved_prices(
+            self.state.best_bid, self.state.best_ask
+        )
+        target_qty = self.order_mgr.calculate_buy_quantity(usdt_balance, initial_buy_price)
+        if target_qty is None:
             print_log("Insufficient balance or quantity too small.", "error")
             time.sleep(3)
             return {"success": False, "skip_pair": True}
 
-        # Place limit buy at improved price
-        try:
-            order = self.order_mgr.place_buy(buy_price, qty)
-            self.state.current_order_id = order.order_id
-        except APIError as e:
-            print_log(f"Failed to place buy order: {e}", "error")
-            time.sleep(2)
-            return {"success": False}
+        max_drift = self.config.buy_max_price_drift_pct
+        price_ceiling = initial_buy_price * (Decimal("1") + max_drift / Decimal("100"))
 
-        self._refresh_dashboard()
-
-        print_log(
-            f"BUY ORDER | Price: {float(buy_price)} | "
-            f"Qty: {float(qty)} | Total: ${float(buy_price * qty)} | "
-            f"OrderID: {order.order_id}",
-            "info",
-        )
-
-        # ── Step 4: Poll buy order ──────────────────────────────────
+        total_filled = Decimal("0")
+        total_cost = Decimal("0")
+        buy_price = initial_buy_price
 
         def on_buy_poll(o):
             self.state.current_order_id = o.order_id
+            # Live-update weighted avg for dashboard during this poll.
+            poll_filled = total_filled + (o.executed_qty or Decimal("0"))
+            poll_cost = total_cost + (o.cumulative_quote_qty or Decimal("0"))
+            if poll_filled > 0:
+                self.state.filled_qty = poll_filled
+                self.state.avg_buy_price = poll_cost / poll_filled
+                self.state.coin_balance = poll_filled
             self._refresh_dashboard()
 
-        result = self.order_mgr.poll_order(
-            order.order_id,
-            self.config.buy_retry_timeout,
-            on_poll=on_buy_poll,
-        )
+        for attempt in range(1, self.config.buy_max_retries + 1):
+            remaining = target_qty - total_filled
+            # Clamp remaining to step size.
+            remaining = self.order_mgr.calculate_sell_quantity(remaining) \
+                if remaining > 0 else Decimal("0")
+            if remaining is None or remaining <= 0:
+                break
 
-        # a) Fully filled
-        if result.status == OrderStatus.FILLED:
-            filled_qty = result.executed_qty
-            avg_price = result.avg_price
-            cost = result.cumulative_quote_qty
+            # Refresh bid to requote (first attempt uses the scan's bid).
+            if attempt > 1:
+                try:
+                    bid, ask = self.api.get_best_bid_ask(self.pair_info.symbol)
+                    self._update_prices(bid, ask)
+                    buy_price, _ = self._compute_improved_prices(bid, ask)
+                except Exception as e:
+                    print_log(f"Error refreshing bid for retry: {e}", "error")
+                    time.sleep(2)
+                    continue
 
+                if buy_price > price_ceiling:
+                    drift_pct = float(
+                        ((buy_price - initial_buy_price) / initial_buy_price) * Decimal("100")
+                    )
+                    print_log(
+                        f"BUY STOP | New price {float(buy_price)} drifted +{drift_pct:.4f}% "
+                        f"> cap {float(max_drift)}%. Keeping partial.",
+                        "warning",
+                    )
+                    break
+
+            try:
+                order = self.order_mgr.place_buy(buy_price, remaining)
+                self.state.current_order_id = order.order_id
+            except APIError as e:
+                print_log(f"Failed to place buy order: {e}", "error")
+                time.sleep(2)
+                continue
+
+            self._refresh_dashboard()
             print_log(
-                f"BUY FILLED | Price: {float(avg_price)} | "
-                f"Qty: {float(filled_qty)} | Cost: ${float(cost)}",
-                "success",
+                f"BUY ORDER #{attempt} | Price: {float(buy_price)} | "
+                f"Qty: {float(remaining)} | Total: ${float(buy_price * remaining)} | "
+                f"OrderID: {order.order_id}",
+                "info",
             )
 
-            self.state.filled_qty = filled_qty
-            self.state.avg_buy_price = avg_price
-            self.state.coin_balance = filled_qty
+            result = self.order_mgr.poll_order(
+                order.order_id,
+                self.config.buy_retry_timeout,
+                on_poll=on_buy_poll,
+            )
 
-            self.tracker.start_trade(avg_price, filled_qty, cost)
+            # Accumulate anything filled.
+            if result.executed_qty and result.executed_qty > 0:
+                total_filled += result.executed_qty
+                total_cost += result.cumulative_quote_qty or Decimal("0")
 
-            return {
-                "success": True,
-                "filled_qty": filled_qty,
-                "avg_price": avg_price,
-                "cost": cost,
-            }
+            if result.status == OrderStatus.FILLED:
+                print_log(
+                    f"BUY FILLED #{attempt} | Filled slice: {float(result.executed_qty)} "
+                    f"@ {float(result.avg_price)}",
+                    "success",
+                )
+                # Check if cumulative reached target.
+                if total_filled >= target_qty - self.pair_info.step_size:
+                    break
+                continue
 
-        # b) Partially filled
-        if result.status == OrderStatus.PARTIALLY_FILLED:
-            self.order_mgr.cancel_order(order.order_id)
+            if result.status == OrderStatus.PARTIALLY_FILLED:
+                self.order_mgr.cancel_order(order.order_id)
+                fill_pct = float(result.fill_pct)
+                print_log(
+                    f"BUY PARTIAL #{attempt} | Slice filled: {float(result.executed_qty)}/"
+                    f"{float(remaining)} ({fill_pct:.1f}%) | Retrying remainder.",
+                    "warning",
+                )
+                continue
 
-            filled_qty = result.executed_qty
-            avg_price = result.avg_price
-            cost = result.cumulative_quote_qty
+            if result.status == OrderStatus.NEW:
+                self.order_mgr.cancel_order(order.order_id)
+                print_log(
+                    f"BUY NOT FILLED #{attempt} | Cancelled, retrying with fresh quote.",
+                    "warning",
+                )
+                continue
 
-            fill_pct = float(result.fill_pct)
+            # Canceled / Rejected / Expired externally — bail with whatever we have.
             print_log(
-                f"BUY PARTIAL | Filled: {float(filled_qty)}/{float(qty)} "
-                f"({fill_pct:.1f}%) | Cancelling remainder.",
+                f"Buy slice ended with status: {result.status.value}. Stopping retries.",
                 "warning",
             )
+            break
 
-            if filled_qty > 0:
-                self.state.filled_qty = filled_qty
-                self.state.avg_buy_price = avg_price
-                self.state.coin_balance = filled_qty
-
-                self.tracker.start_trade(avg_price, filled_qty, cost)
-
-                return {
-                    "success": True,
-                    "filled_qty": filled_qty,
-                    "avg_price": avg_price,
-                    "cost": cost,
-                }
-
+        if total_filled <= 0:
             return {"success": False}
 
-        # c) Not filled (NEW at timeout) or canceled/other
-        if result.status == OrderStatus.NEW:
-            self.order_mgr.cancel_order(order.order_id)
-            print_log("BUY NOT FILLED | Cancelling & rescanning.", "warning")
-        else:
-            print_log(
-                f"Buy order ended with status: {result.status.value}",
-                "warning",
-            )
+        avg_price = total_cost / total_filled
+        self.state.filled_qty = total_filled
+        self.state.avg_buy_price = avg_price
+        self.state.coin_balance = total_filled
 
-        return {"success": False}
+        self.tracker.start_trade(avg_price, total_filled, total_cost)
+
+        fill_ratio = float(total_filled / target_qty * Decimal("100"))
+        print_log(
+            f"BUY COMPLETE | Filled: {float(total_filled)}/{float(target_qty)} "
+            f"({fill_ratio:.1f}%) | Avg: {float(avg_price)} | Cost: ${float(total_cost)}",
+            "success",
+        )
+
+        return {
+            "success": True,
+            "filled_qty": total_filled,
+            "avg_price": avg_price,
+            "cost": total_cost,
+        }
 
     # ── Step 5: Place sell ───────────────────────────────────────────
 
@@ -373,14 +435,26 @@ class TradingEngine:
         _, improved_sell = self._compute_improved_prices(bid, current_ask)
         sell_price = self.order_mgr.truncate_price(improved_sell)
 
-        # Check if truncated sell price > buy price (profitable)
+        # If the market has moved against us (ask <= buy), don't wait for
+        # price to recover. Place a passive limit sell at buy + avg spread
+        # and hold the order without cancel/re-place until it fills.
+        above_market = False
         if sell_price <= avg_buy_price:
+            avg_spread = self._avg_spread_pct()
+            target = avg_buy_price * (Decimal("1") + avg_spread / Decimal("100"))
+            sell_price = self.order_mgr.truncate_price(target)
+            # Ensure strictly above buy price after truncation (bump by 1 tick if needed).
+            if sell_price <= avg_buy_price:
+                sell_price = self.order_mgr.truncate_price(
+                    avg_buy_price + self.pair_info.tick_size
+                )
+            above_market = True
             print_log(
-                f"Sell price ({float(sell_price)}) <= Buy price ({float(avg_buy_price)}). "
-                f"Entering HOLD mode.",
+                f"ABOVE-MARKET SELL | Ask {float(current_ask)} <= Buy {float(avg_buy_price)} | "
+                f"Placing passive sell at {float(sell_price)} (buy + avg spread "
+                f"{float(avg_spread):.4f}%)",
                 "warning",
             )
-            return {"action": "holding"}
 
         # Calculate sell quantity
         sell_qty = self.order_mgr.calculate_sell_quantity(filled_qty)
@@ -419,6 +493,22 @@ class TradingEngine:
             self.config.sell_retry_timeout,
             on_poll=on_sell_poll,
         )
+
+        # Above-market sell: keep polling the SAME order indefinitely — don't
+        # cancel and re-place. We accept partial fills as they come.
+        while above_market and result.status == OrderStatus.NEW:
+            if self.state.is_shutting_down:
+                break
+            print_log(
+                f"ABOVE-MARKET SELL | Still open at {float(sell_price)} | "
+                f"Continuing to wait without refresh...",
+                "info",
+            )
+            result = self.order_mgr.poll_order(
+                order.order_id,
+                self.config.sell_retry_timeout,
+                on_poll=on_sell_poll,
+            )
 
         # a) Fully filled
         if result.status == OrderStatus.FILLED:
