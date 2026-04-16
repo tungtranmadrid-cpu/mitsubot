@@ -219,6 +219,19 @@ class MexcAPI:
             "limit": limit,
         })
 
+    def get_klines(self, symbol: str, interval: str = "5m", limit: int = 50) -> list[list]:
+        """GET /api/v3/klines — fetch candlestick data.
+
+        Each entry: [openTime, open, high, low, close, volume, closeTime, quoteVolume]
+        Returns newest candle last.
+        """
+        data = self._request("GET", "/api/v3/klines", {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit,
+        })
+        return data
+
     def get_recent_trades(self, symbol: str, limit: int = 200) -> list[dict]:
         """GET /api/v3/trades — fetch recent public trades."""
         data = self._request("GET", "/api/v3/trades", {

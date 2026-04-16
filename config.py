@@ -31,6 +31,9 @@ class Config:
     pair_cooldown_losses: int          # consecutive losses on a pair before cooldown
     pair_cooldown_seconds: int         # how long to ban a pair after consecutive losses
     max_volatility_pct: Decimal        # skip if 5-min price range > this %
+    ma_fast_period: int                # MA fast period for trend filter (e.g. 5)
+    ma_slow_period: int                # MA slow period for trend filter (e.g. 20)
+    ma_kline_interval: str             # kline interval for MA calculation (e.g. "5m")
 
 
 def load_config(env_path: str = ".env") -> Config:
@@ -107,6 +110,9 @@ def load_config(env_path: str = ".env") -> Config:
             pair_cooldown_losses=int(os.getenv("PAIR_COOLDOWN_LOSSES", "3")),
             pair_cooldown_seconds=int(os.getenv("PAIR_COOLDOWN_SECONDS", "300")),
             max_volatility_pct=Decimal(os.getenv("MAX_VOLATILITY_PCT", "5.0")),
+            ma_fast_period=int(os.getenv("MA_FAST_PERIOD", "5")),
+            ma_slow_period=int(os.getenv("MA_SLOW_PERIOD", "20")),
+            ma_kline_interval=os.getenv("MA_KLINE_INTERVAL", "5m"),
         )
     except (ValueError, TypeError) as e:
         print(f"[ERROR] Invalid config value: {e}")

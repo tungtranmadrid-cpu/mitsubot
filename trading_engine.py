@@ -251,6 +251,68 @@ class TradingEngine:
             print_log(f"Error checking volatility: {e}", "error")
             return True  # don't block on error
 
+    def _check_ma_trend(self, symbol: str) -> bool:
+        """Check that MA_fast > MA_slow (uptrend) using kline data.
+
+        Fetches recent candles and computes two simple moving averages from
+        close prices. If MA5 < MA20 the market is in a downtrend — skip.
+        """
+        try:
+            fast = self.config.ma_fast_period
+            slow = self.config.ma_slow_period
+            # Fetch enough candles to compute the slow MA.
+            klines = self.api.get_klines(
+                symbol,
+                interval=self.config.ma_kline_interval,
+                limit=slow + 1,  # +1 because the last candle may be incomplete
+            )
+            if not klines or len(klines) < slow:
+                print_log(
+                    f"MA TREND | Not enough kline data ({len(klines) if klines else 0} "
+                    f"< {slow}). Allowing.",
+                    "warning",
+                )
+                return True
+
+            # Use all completed candles (exclude the last which is still forming).
+            closes = [Decimal(str(k[4])) for k in klines[:-1]]
+            if len(closes) < slow:
+                return True
+
+            ma_fast = sum(closes[-fast:]) / Decimal(fast)
+            ma_slow = sum(closes[-slow:]) / Decimal(slow)
+            current_price = closes[-1]
+
+            if ma_fast < ma_slow:
+                pct_below = float(((ma_slow - ma_fast) / ma_slow) * Decimal("100"))
+                print_log(
+                    f"MA DOWNTREND | MA{fast}={float(ma_fast):.6f} < "
+                    f"MA{slow}={float(ma_slow):.6f} [{pct_below:.4f}% below] | "
+                    f"Price={float(current_price):.6f}. Skip.",
+                    "warning",
+                )
+                return False
+
+            # Also reject if price is below MA slow (even if MAs haven't crossed yet).
+            if current_price < ma_slow:
+                pct_below = float(((ma_slow - current_price) / ma_slow) * Decimal("100"))
+                print_log(
+                    f"PRICE BELOW MA{slow} | Price={float(current_price):.6f} < "
+                    f"MA{slow}={float(ma_slow):.6f} [{pct_below:.4f}% below]. Skip.",
+                    "warning",
+                )
+                return False
+
+            print_log(
+                f"MA UPTREND | MA{fast}={float(ma_fast):.6f} > "
+                f"MA{slow}={float(ma_slow):.6f} | Price={float(current_price):.6f}. OK.",
+                "info",
+            )
+            return True
+        except Exception as e:
+            print_log(f"Error checking MA trend: {e}", "error")
+            return True  # don't block on error
+
     def record_trade_result(self, symbol: str, is_loss: bool) -> None:
         """Track consecutive losses per pair and activate cooldown if needed."""
         if is_loss:
@@ -284,6 +346,11 @@ class TradingEngine:
         # Safety: pair cooldown check (no API call needed)
         if not self._check_pair_cooldown(self.pair_info.symbol):
             time.sleep(1)
+            return False
+
+        # Safety: MA trend filter — reject if MA5 < MA20 (downtrend)
+        if not self._check_ma_trend(self.pair_info.symbol):
+            time.sleep(3)
             return False
 
         # Fetch orderbook
