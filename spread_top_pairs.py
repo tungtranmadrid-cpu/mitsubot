@@ -79,7 +79,11 @@ def create_exchange(name: str = "mexc"):
     return factory()
 
 
-def scan_top_spread_pairs(top_n: int = 15, min_volume_1h: float = 150_000) -> list[str]:
+def scan_top_spread_pairs(
+    top_n: int = 15,
+    min_volume_1h: float = 150_000,
+    ban_pairs: frozenset | set | None = None,
+) -> list[str]:
     """
     Scan MEXC for top spread USDT pairs.
 
@@ -95,6 +99,8 @@ def scan_top_spread_pairs(top_n: int = 15, min_volume_1h: float = 150_000) -> li
     logger.info("Fetching tickers from MEXC...")
     tickers = ex.fetch_tickers()
 
+    banned = frozenset(ban_pairs or ())
+
     # Step 1: Filter USDT pairs with sufficient volume
     # Estimate 1h volume as 24h volume / 24
     min_volume_24h = min_volume_1h * 24
@@ -107,6 +113,8 @@ def scan_top_spread_pairs(top_n: int = 15, min_volume_1h: float = 150_000) -> li
             continue
         base, quote = sym.split("/", 1)
         if quote != "USDT":
+            continue
+        if sym.replace("/", "") in banned:
             continue
 
         qv = t.get("quoteVolume")
@@ -352,12 +360,14 @@ class PairRefresher:
         interval_seconds: int = 3600,
         top_n: int = 15,
         min_volume_1h: float = 150_000,
+        ban_pairs: frozenset | set | None = None,
     ):
         self.engine = engine
         self.api = api
         self.interval = interval_seconds
         self.top_n = top_n
         self.min_volume_1h = min_volume_1h
+        self.ban_pairs = frozenset(ban_pairs or ())
         self._stop_event = threading.Event()
         self._thread = None
 
@@ -400,6 +410,7 @@ class PairRefresher:
             new_pairs = scan_top_spread_pairs(
                 top_n=self.top_n,
                 min_volume_1h=self.min_volume_1h,
+                ban_pairs=self.ban_pairs,
             )
 
             if not new_pairs:

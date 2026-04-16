@@ -40,6 +40,9 @@ class TradingEngine:
         self.pairs_info = pairs_info or {pair_info.symbol: pair_info}
         # Rolling spread_pct history per pair (for above-market sell pricing).
         self._spread_history: dict[str, deque] = {}
+        # Safety: consecutive loss counter per pair and cooldown timestamps.
+        self._consecutive_losses: dict[str, int] = {}
+        self._pair_cooldown_until: dict[str, float] = {}
 
     def switch_pair(self, symbol: str) -> None:
         """Switch to a different trading pair before a new cycle."""
@@ -153,6 +156,120 @@ class TradingEngine:
 
         return buy_price, sell_price
 
+    # ── Safety checks ────────────────────────────────────────────────
+
+    def _check_bid_depth(self, symbol: str, order_size_usdt: Decimal) -> bool:
+        """Check that top-5 bid depth >= min_bid_depth_multiplier × order size.
+
+        Prevents entering illiquid books where our order would move the market.
+        """
+        try:
+            book = self.api.get_orderbook(symbol, limit=5)
+            bids = book.get("bids", [])
+            if not bids:
+                return False
+            bid_depth = sum(
+                Decimal(str(b[0])) * Decimal(str(b[1])) for b in bids
+            )
+            required = order_size_usdt * self.config.min_bid_depth_multiplier
+            if bid_depth < required:
+                print_log(
+                    f"DEPTH TOO THIN | Bid depth ${float(bid_depth):,.0f} "
+                    f"< {float(self.config.min_bid_depth_multiplier)}× order "
+                    f"${float(order_size_usdt):,.0f} = ${float(required):,.0f}. Skip.",
+                    "warning",
+                )
+                return False
+            return True
+        except Exception as e:
+            print_log(f"Error checking bid depth: {e}", "error")
+            return False
+
+    def _check_max_spread(self, spread_pct: Decimal) -> bool:
+        """Reject spreads that are TOO wide (illiquid / dangerous)."""
+        if spread_pct > self.config.max_spread_pct:
+            print_log(
+                f"SPREAD TOO WIDE | {float(spread_pct):.4f}% "
+                f"> max {float(self.config.max_spread_pct)}%. Skip.",
+                "warning",
+            )
+            return False
+        return True
+
+    def _check_pair_cooldown(self, symbol: str) -> bool:
+        """Check if this pair is in cooldown after consecutive losses."""
+        until = self._pair_cooldown_until.get(symbol, 0)
+        if time.time() < until:
+            remaining = int(until - time.time())
+            print_log(
+                f"COOLDOWN | {symbol} banned for {remaining}s more "
+                f"after {self.config.pair_cooldown_losses} consecutive losses.",
+                "warning",
+            )
+            return False
+        return True
+
+    def _check_volatility(self, symbol: str) -> bool:
+        """Check that 5-minute price range is below threshold.
+
+        Uses recent trades timestamps to filter only trades within last 5 min,
+        then computes (high - low) / low as volatility %.
+        """
+        try:
+            trades = self.api.get_recent_trades(symbol, limit=200)
+            if not trades:
+                return True  # no data → don't block
+
+            now_ms = int(time.time() * 1000)
+            five_min_ago = now_ms - 5 * 60 * 1000
+
+            prices_5m = []
+            for t in trades:
+                trade_time = int(t.get("time", 0))
+                if trade_time >= five_min_ago:
+                    prices_5m.append(Decimal(str(t["price"])))
+
+            if len(prices_5m) < 2:
+                return True  # not enough data
+
+            high = max(prices_5m)
+            low = min(prices_5m)
+            if low <= 0:
+                return True
+
+            volatility_pct = ((high - low) / low) * Decimal("100")
+            if volatility_pct > self.config.max_volatility_pct:
+                print_log(
+                    f"VOLATILITY TOO HIGH | 5m range: {float(volatility_pct):.4f}% "
+                    f"(high={float(high)}, low={float(low)}) "
+                    f"> max {float(self.config.max_volatility_pct)}%. Skip.",
+                    "warning",
+                )
+                return False
+            return True
+        except Exception as e:
+            print_log(f"Error checking volatility: {e}", "error")
+            return True  # don't block on error
+
+    def record_trade_result(self, symbol: str, is_loss: bool) -> None:
+        """Track consecutive losses per pair and activate cooldown if needed."""
+        if is_loss:
+            self._consecutive_losses[symbol] = self._consecutive_losses.get(symbol, 0) + 1
+            count = self._consecutive_losses[symbol]
+            if count >= self.config.pair_cooldown_losses:
+                self._pair_cooldown_until[symbol] = (
+                    time.time() + self.config.pair_cooldown_seconds
+                )
+                print_log(
+                    f"COOLDOWN ACTIVATED | {symbol}: {count} consecutive losses → "
+                    f"banned for {self.config.pair_cooldown_seconds}s.",
+                    "error",
+                )
+                self._consecutive_losses[symbol] = 0
+        else:
+            # Win resets the counter.
+            self._consecutive_losses[symbol] = 0
+
     # ── Step 2: Scan with VWAP ──────────────────────────────────────
 
     def step_scan(self) -> bool:
@@ -163,6 +280,11 @@ class TradingEngine:
         """
         self.state.status = BotStatus.SCANNING
         self.state.current_order_id = None
+
+        # Safety: pair cooldown check (no API call needed)
+        if not self._check_pair_cooldown(self.pair_info.symbol):
+            time.sleep(1)
+            return False
 
         # Fetch orderbook
         try:
@@ -208,6 +330,22 @@ class TradingEngine:
                 f"(min: {float(self.config.min_spread_pct)}%)",
                 "warning",
             )
+            time.sleep(3)
+            return False
+
+        # Check 2b: spread must NOT be too wide (illiquid / dangerous)
+        if not self._check_max_spread(self.state.spread_pct):
+            time.sleep(3)
+            return False
+
+        # Check 2c: bid depth must be thick enough relative to our order size
+        estimated_order = self.state.usdt_balance * self.config.buy_trade_percent / Decimal("100")
+        if estimated_order > 0 and not self._check_bid_depth(self.pair_info.symbol, estimated_order):
+            time.sleep(3)
+            return False
+
+        # Check 2d: 5-min volatility must be below threshold
+        if not self._check_volatility(self.pair_info.symbol):
             time.sleep(3)
             return False
 
@@ -519,6 +657,9 @@ class TradingEngine:
             pnl = self.tracker.complete_sell(
                 avg_sell_price, sold_qty, revenue, avg_buy_price
             )
+
+            # Track consecutive losses for pair cooldown.
+            self.record_trade_result(self.pair_info.symbol, is_loss=(pnl < 0))
 
             pnl_pct = float(((avg_sell_price - avg_buy_price) / avg_buy_price) * 100)
             print_log(

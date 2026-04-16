@@ -17,6 +17,7 @@ class Config:
     mexc_base_url: str
     default_pair: str
     pairs: tuple                # tuple of pair strings, e.g. ("BTCUSDT", "ETHUSDT")
+    ban_pairs: frozenset        # pairs forbidden from trading (filtered out everywhere)
     buy_trade_percent: Decimal
     sell_trade_percent: Decimal
     buy_retry_timeout: int      # milliseconds
@@ -25,6 +26,11 @@ class Config:
     buy_max_price_drift_pct: Decimal   # stop retrying partial buy if price drifted more than this %
     buy_max_retries: int               # max partial-fill retry iterations (hard safety cap)
     spread_history_size: int           # rolling window for avg bid-ask spread per pair
+    max_spread_pct: Decimal            # skip if spread > this % (too wide = illiquid/dangerous)
+    min_bid_depth_multiplier: Decimal  # bid depth (top 5) must be >= X × order size
+    pair_cooldown_losses: int          # consecutive losses on a pair before cooldown
+    pair_cooldown_seconds: int         # how long to ban a pair after consecutive losses
+    max_volatility_pct: Decimal        # skip if 5-min price range > this %
 
 
 def load_config(env_path: str = ".env") -> Config:
@@ -56,18 +62,28 @@ def load_config(env_path: str = ".env") -> Config:
     from pairs_store import load_pairs as load_saved_pairs
 
     default_pair = os.getenv("DEFAULT_PAIR", "BTCUSDT").upper()
+
+    banpair_raw = os.getenv("BANPAIR", "").strip()
+    ban_pairs = frozenset(
+        p.strip().upper() for p in banpair_raw.split(",") if p.strip()
+    )
+
     saved = load_saved_pairs()
     if saved:
-        pairs = tuple(saved)
+        pairs = tuple(p for p in saved if p not in ban_pairs)
     else:
         pairs_raw = os.getenv("PAIRS", "").strip()
         if pairs_raw:
-            pairs = tuple(p.strip().upper() for p in pairs_raw.split(",") if p.strip())
+            pairs = tuple(
+                p.strip().upper()
+                for p in pairs_raw.split(",")
+                if p.strip() and p.strip().upper() not in ban_pairs
+            )
         else:
-            pairs = (default_pair,)
+            pairs = () if default_pair in ban_pairs else (default_pair,)
 
     if not pairs:
-        print("[ERROR] No trading pairs configured. Set PAIRS or DEFAULT_PAIR.")
+        print("[ERROR] No trading pairs configured. Set PAIRS or DEFAULT_PAIR (and check BANPAIR).")
         sys.exit(1)
 
     try:
@@ -77,6 +93,7 @@ def load_config(env_path: str = ".env") -> Config:
             mexc_base_url=os.getenv("MEXC_BASE_URL", "https://api.mexc.com").rstrip("/"),
             default_pair=default_pair,
             pairs=pairs,
+            ban_pairs=ban_pairs,
             buy_trade_percent=Decimal(os.getenv("BUY_TRADE_PERCENT", "99.5")),
             sell_trade_percent=Decimal(os.getenv("SELL_TRADE_PERCENT", "100")),
             buy_retry_timeout=int(os.getenv("BUY_RETRY_TIMEOUT", "5000")),
@@ -85,6 +102,11 @@ def load_config(env_path: str = ".env") -> Config:
             buy_max_price_drift_pct=Decimal(os.getenv("BUY_MAX_PRICE_DRIFT_PCT", "0.3")),
             buy_max_retries=int(os.getenv("BUY_MAX_RETRIES", "10")),
             spread_history_size=int(os.getenv("SPREAD_HISTORY_SIZE", "30")),
+            max_spread_pct=Decimal(os.getenv("MAX_SPREAD_PCT", "2.0")),
+            min_bid_depth_multiplier=Decimal(os.getenv("MIN_BID_DEPTH_MULTIPLIER", "3.0")),
+            pair_cooldown_losses=int(os.getenv("PAIR_COOLDOWN_LOSSES", "3")),
+            pair_cooldown_seconds=int(os.getenv("PAIR_COOLDOWN_SECONDS", "300")),
+            max_volatility_pct=Decimal(os.getenv("MAX_VOLATILITY_PCT", "5.0")),
         )
     except (ValueError, TypeError) as e:
         print(f"[ERROR] Invalid config value: {e}")

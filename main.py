@@ -207,6 +207,7 @@ def main():
         interval_seconds=3600,   # 1 hour
         top_n=15,                # top 15 pairs by spread
         min_volume_1h=150_000,   # min 1h volume 150k USDT
+        ban_pairs=config.ban_pairs,
     )
     _refresher.start()
     print_log("Pair refresher started (every 1 hour, top 15 by spread, min 1h vol $150K)", "info")
