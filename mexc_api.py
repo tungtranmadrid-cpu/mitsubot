@@ -222,14 +222,18 @@ class MexcAPI:
     def get_klines(self, symbol: str, interval: str = "5m", limit: int = 50) -> list[list]:
         """GET /api/v3/klines — fetch candlestick data.
 
+        Uses a clean request WITHOUT the X-MEXC-APIKEY header because MEXC
+        treats any request carrying that header as signed and rejects it with
+        "Mandatory parameter 'signature'" for some symbols.
+
         Each entry: [openTime, open, high, low, close, volume, closeTime, quoteVolume]
         Returns newest candle last.
         """
-        data = self._request("GET", "/api/v3/klines", {
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit,
-        })
+        self._throttle()
+        url = f"{self.base_url}/api/v3/klines"
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        resp = requests.get(url, params=params, timeout=10)  # no session, no API key
+        data = self._handle_response(resp)
         return data
 
     def get_recent_trades(self, symbol: str, limit: int = 200) -> list[dict]:

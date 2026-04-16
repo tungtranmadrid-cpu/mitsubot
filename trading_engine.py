@@ -310,8 +310,11 @@ class TradingEngine:
             )
             return True
         except Exception as e:
-            print_log(f"Error checking MA trend: {e}", "error")
-            return True  # don't block on error
+            print_log(
+                f"Error checking MA trend for {symbol}: {e}. Skipping pair (safe default).",
+                "error",
+            )
+            return False  # BLOCK on error — safer to skip pair than buy blindly
 
     def record_trade_result(self, symbol: str, is_loss: bool) -> None:
         """Track consecutive losses per pair and activate cooldown if needed."""
