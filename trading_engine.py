@@ -368,7 +368,7 @@ class TradingEngine:
 
         # Compute VWAP from recent trades
         try:
-            vwap_long, vwap_short = self._compute_vwap()
+            vwap_long, _ = self._compute_vwap()
             self.state.vwap = vwap_long
         except Exception as e:
             print_log(f"Error computing VWAP: {e}", "error")
@@ -382,16 +382,8 @@ class TradingEngine:
             time.sleep(3)
             return False
 
-        # Check 1: VWAP trend must be UP (short > long)
-        if vwap_short <= vwap_long:
-            trend_pct = float(((vwap_short - vwap_long) / vwap_long) * Decimal("100"))
-            print_log(
-                f"VWAP downtrend: Short({float(vwap_short)}) <= Long({float(vwap_long)}) "
-                f"[{trend_pct:.4f}%]. Skipping.",
-                "warning",
-            )
-            time.sleep(3)
-            return False
+        # Trend is handled by MA filter (step 2). VWAP is only used for
+        # fair-value reference in checks 3 & 4.
 
         # Check 2: bid-ask spread must be sufficient
         if self.state.spread_pct < self.config.min_spread_pct:
@@ -440,12 +432,10 @@ class TradingEngine:
             time.sleep(3)
             return False
 
-        trend_pct = float(((vwap_short - vwap_long) / vwap_long) * Decimal("100"))
         discount_pct = float(((vwap_long - bid) / vwap_long) * Decimal("100"))
         premium_pct = float(((ask - vwap_long) / vwap_long) * Decimal("100"))
         print_log(
             f"BID: {float(bid)} | VWAP: {float(vwap_long)} | ASK: {float(ask)} | "
-            f"Trend: +{trend_pct:.4f}% | "
             f"Discount: -{discount_pct:.4f}% | Premium: +{premium_pct:.4f}%",
             "info",
         )
