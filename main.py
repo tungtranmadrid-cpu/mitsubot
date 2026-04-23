@@ -20,7 +20,7 @@ from spread_top_pairs import PairRefresher
 
 import os as _os
 
-_log_handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+_log_handlers = [logging.StreamHandler(sys.stdout)]
 if _os.getenv("LOG_FILE", "").strip():
     _log_handlers.append(logging.FileHandler(_os.environ["LOG_FILE"], encoding="utf-8"))
 
