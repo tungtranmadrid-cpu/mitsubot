@@ -14,7 +14,8 @@ from pnl_tracker import PnLTracker
 from trading_engine import TradingEngine
 from models import BotState, BotStatus
 from display import print_log, print_summary, print_dashboard, console
-from spread_top_pairs import PairRefresher
+from spread_top_pairs import PairRefresher, scan_top_spread_pairs
+from pairs_store import save_pairs
 
 # ── Logging setup ────────────────────────────────────────────────────
 
@@ -123,6 +124,28 @@ def main():
     config = load_config()
 
     _api = MexcAPI(config)
+
+    # If no pairs were loaded (first boot, no data/pairs.json, no PAIRS in .env),
+    # run a blocking scan now so the engine has something to start with.
+    if not config.pairs:
+        print_log("No pairs configured — running initial scan (this may take a minute)...", "warning")
+        try:
+            initial_pairs = scan_top_spread_pairs(
+                top_n=15,
+                min_volume_1h=30_000,
+                ban_pairs=config.ban_pairs,
+            )
+            if initial_pairs:
+                save_pairs(initial_pairs)
+                print_log(f"Initial scan complete: {', '.join(initial_pairs[:5])}...", "success")
+                # Reload config with the freshly scanned pairs
+                config = load_config()
+            else:
+                print_log("Initial scan returned no pairs. Check network/API.", "error")
+                sys.exit(1)
+        except Exception as e:
+            print_log(f"Initial scan failed: {e}", "error")
+            sys.exit(1)
 
     # Fetch exchange info for all configured pairs
     pairs_info = {}
